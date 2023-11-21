@@ -10,6 +10,8 @@ from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
 
 from ldm.util import instantiate_from_config
 
+import copy
+
 
 class VQModel(pl.LightningModule):
     def __init__(self,
@@ -280,6 +282,38 @@ class VQModelInterface(VQModel):
         quant = self.post_quant_conv(quant)
         dec = self.decoder(quant)
         return dec
+
+
+class VQModelRetrainable(pl.LightningModule):
+    def __init__(self, model):
+        super().__init__()
+        self.vqmodel = model
+
+    def freeze_encoder(self):
+        for param in self.vqmodel.enoder.parameters():
+            param.requires_grad = False
+
+    def unfreeze_encoder(self):
+        for param in self.vqmodel.encoder.parameters():
+            param.requires_grad = True
+
+    def clear_decoder(self):
+        self.decoder_backup = copy.deepcopy(self.vqmodel.decoder)
+        for layer in self.vqmodel.decoder.children():
+            if hasattr(layer, 'reset_parameters'):
+                layer.reset_parameters()
+
+    def restore_decoder(self):
+        self.vqmodel.decoder = copy.deepcopy(self.decoder_backup)
+
+    def forward(self, x):
+        return self.vqmodel.forward(x)
+
+    def encode(self, x):
+        return self.vqmodel.encode(x)
+
+    def decode(self, x):
+        return self.vqmodel.decode(x)
 
 
 class AutoencoderKL(pl.LightningModule):
