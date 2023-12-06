@@ -1,12 +1,17 @@
 import torch
 import pytorch_lightning as pl
 import torch.nn.functional as F
+import numpy as np
+from torch.optim.lr_scheduler import LambdaLR
 from contextlib import contextmanager
+from packaging import version
 
 from taming.modules.vqvae.quantize import VectorQuantizer2 as VectorQuantizer
 
 from ldm.modules.diffusionmodules.model import Encoder, Decoder
+from ldm.modules.ema import LitEma
 from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
+from ldm.modules.autoencoder_transformations import Identity, Invert
 
 from ldm.util import instantiate_from_config
 
@@ -151,7 +156,8 @@ class VQModel(pl.LightningModule):
             # autoencode
             aeloss, log_dict_ae = self.loss(qloss, x, xrec, optimizer_idx, self.global_step,
                                             last_layer=self.get_last_layer(), split="train",
-                                            predicted_indices=ind)
+                                            # predicted_indices=ind)
+                                            )
 
             self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
             return aeloss
@@ -176,14 +182,13 @@ class VQModel(pl.LightningModule):
                                         self.global_step,
                                         last_layer=self.get_last_layer(),
                                         split="val"+suffix,
-                                        predicted_indices=ind
+                                        # predicted_indices=ind
                                         )
-
         discloss, log_dict_disc = self.loss(qloss, x, xrec, 1,
                                             self.global_step,
                                             last_layer=self.get_last_layer(),
                                             split="val"+suffix,
-                                            predicted_indices=ind
+                                            # predicted_indices=ind
                                             )
         rec_loss = log_dict_ae[f"val{suffix}/rec_loss"]
         self.log(f"val{suffix}/rec_loss", rec_loss,
@@ -284,36 +289,84 @@ class VQModelInterface(VQModel):
         return dec
 
 
-class VQModelRetrainable(pl.LightningModule):
-    def __init__(self, model):
-        super().__init__()
-        self.vqmodel = model
+class VQModelRetrainable(VQModel):
+    def __init__(self, target_transformation_fn, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.target_transformation_fn = instantiate_from_config(target_transformation_fn)
+
+    def init_from_ckpt(self, path, ignore_keys=list()):
+        super().init_from_ckpt(path, ignore_keys)
+        self.freeze_encoder()
+        self.clear_decoder()
 
     def freeze_encoder(self):
-        for param in self.vqmodel.enoder.parameters():
+        for param in self.encoder.parameters():
             param.requires_grad = False
 
     def unfreeze_encoder(self):
-        for param in self.vqmodel.encoder.parameters():
+        for param in self.encoder.parameters():
             param.requires_grad = True
 
     def clear_decoder(self):
-        self.decoder_backup = copy.deepcopy(self.vqmodel.decoder)
-        for layer in self.vqmodel.decoder.children():
+        self.decoder_backup = copy.deepcopy(self.decoder)
+        for layer in self.decoder.children():
             if hasattr(layer, 'reset_parameters'):
                 layer.reset_parameters()
 
     def restore_decoder(self):
-        self.vqmodel.decoder = copy.deepcopy(self.decoder_backup)
+        self.decoder = copy.deepcopy(self.decoder_backup)
 
-    def forward(self, x):
-        return self.vqmodel.forward(x)
+    def training_step(self, batch, batch_idx, optimizer_idx):
+        # https://github.com/pytorch/pytorch/issues/37142
+        # try not to fool the heuristics
+        x = self.get_input(batch, self.image_key)
+        xrec, qloss, ind = self(x, return_pred_indices=True)
+        xtar = self.target_transformation_fn(x)
 
-    def encode(self, x):
-        return self.vqmodel.encode(x)
+        if optimizer_idx == 0:
+            # autoencode
+            aeloss, log_dict_ae = self.loss(qloss, xtar, xrec, optimizer_idx, self.global_step,
+                                            last_layer=self.get_last_layer(), split="train",
+                                            # predicted_indices=ind)
+                                            )
 
-    def decode(self, x):
-        return self.vqmodel.decode(x)
+            self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
+            return aeloss
+
+        if optimizer_idx == 1:
+            # discriminator
+            discloss, log_dict_disc = self.loss(qloss, xtar, xrec, optimizer_idx, self.global_step,
+                                            last_layer=self.get_last_layer(), split="train")
+            self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True)
+            return discloss
+
+    def _validation_step(self, batch, batch_idx, suffix=""):
+        x = self.get_input(batch, self.image_key)
+        xrec, qloss, ind = self(x, return_pred_indices=True)
+        xtar = self.target_transformation_fn(x)
+        aeloss, log_dict_ae = self.loss(qloss, xtar, xrec, 0,
+                                        self.global_step,
+                                        last_layer=self.get_last_layer(),
+                                        split="val"+suffix,
+                                        # predicted_indices=ind
+                                        )
+
+        discloss, log_dict_disc = self.loss(qloss, xtar, xrec, 1,
+                                            self.global_step,
+                                            last_layer=self.get_last_layer(),
+                                            split="val"+suffix,
+                                            # predicted_indices=ind
+                                            )
+        rec_loss = log_dict_ae[f"val{suffix}/rec_loss"]
+        self.log(f"val{suffix}/rec_loss", rec_loss,
+                   prog_bar=True, logger=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log(f"val{suffix}/aeloss", aeloss,
+                   prog_bar=True, logger=True, on_step=False, on_epoch=True, sync_dist=True)
+        if version.parse(pl.__version__) >= version.parse('1.4.0'):
+            del log_dict_ae[f"val{suffix}/rec_loss"]
+        self.log_dict(log_dict_ae)
+        self.log_dict(log_dict_disc)
+        return self.log_dict
 
 
 class AutoencoderKL(pl.LightningModule):
